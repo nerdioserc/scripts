@@ -19,7 +19,7 @@ $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
     'Microsoft.Insights','Microsoft.OperationalInsights','Microsoft.DesktopVirtualization',
     'Microsoft.Network','Microsoft.AAD','Microsoft.RecoveryServices','Microsoft.Web',
-    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql'
+    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql','Microsoft.Marketplace'
 )
 
 # ====================================================================
