@@ -475,7 +475,7 @@ if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyCont
 $SqlPassword    = New-StrongPassword -Length 20
 $deploymentName = "nmm-deploy-$(Get-Date -Format 'yyyyMMddHHmmss')"
 
-$templatePath = Join-Path $env:TEMP "nmm-template-$(Get-Random).json"
+$templatePath = Join-Path ([System.IO.Path]::GetTempPath()) "nmm-template-$(Get-Random).json"
 $nmmTemplateJson | Out-File -FilePath $templatePath -Encoding UTF8
 
 $job = New-AzResourceGroupDeployment `
