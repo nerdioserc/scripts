@@ -198,7 +198,37 @@ function Show-GeographyPrompt {
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
     throw "Azure CLI ('az') not found. Run in Cloud Shell or install the Azure CLI."
 }
-if ($SubscriptionId) { az account set --subscription $SubscriptionId --only-show-errors | Out-Null }
+
+if (-not $SubscriptionId) {
+    $allSubs = az account list --only-show-errors 2>$null | ConvertFrom-Json
+    if (-not $allSubs -or @($allSubs).Count -eq 0) {
+        throw "No Azure subscriptions found. Run 'az login' first."
+    }
+    if (@($allSubs).Count -eq 1) {
+        $SubscriptionId = $allSubs[0].id
+        Write-Host ("Using only available subscription: {0}" -f $allSubs[0].name) -ForegroundColor DarkGray
+    } else {
+        Write-Host ''
+        Write-Host "Select an Azure subscription:" -ForegroundColor Cyan
+        $defaultIdx = 1
+        for ($i = 0; $i -lt $allSubs.Count; $i++) {
+            $marker = if ($allSubs[$i].isDefault) { ' (current)' } else { '' }
+            Write-Host ("  {0,2}. {1}  [{2}]{3}" -f ($i + 1), $allSubs[$i].name, $allSubs[$i].id, $marker)
+            if ($allSubs[$i].isDefault) { $defaultIdx = $i + 1 }
+        }
+        $pick = Read-Host "Enter choice [$defaultIdx]"
+        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $defaultIdx }
+        $idx = 0
+        if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $allSubs.Count) {
+            throw "Invalid subscription choice."
+        }
+        $SubscriptionId = $allSubs[$idx - 1].id
+        Write-Host ("Selected: {0}" -f $allSubs[$idx - 1].name) -ForegroundColor Green
+    }
+}
+
+az account set --subscription $SubscriptionId --only-show-errors | Out-Null
+Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue | Out-Null
 
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run 'az login' first." }
