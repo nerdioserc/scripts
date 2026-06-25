@@ -19,7 +19,7 @@ $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
     'Microsoft.Insights','Microsoft.OperationalInsights','Microsoft.DesktopVirtualization',
     'Microsoft.Network','Microsoft.AAD','Microsoft.RecoveryServices','Microsoft.Web',
-    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql','Microsoft.Marketplace'
+    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql','Microsoft.Marketplace','Microsoft.MarketplaceOrdering'
 )
 
 # ====================================================================
@@ -472,17 +472,12 @@ if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyCont
     New-AzResourceGroup -Name $ResourceGroupName -Location $Location
 }
 
-Write-Host "Checking Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
-try {
-    $terms = Get-AzMarketplaceTerms -Publisher 'nerdio' -Product 'nmm' -Name 'nmm-plan' -ErrorAction Stop
-    if (-not $terms.Accepted) {
-        Set-AzMarketplaceTerms -Publisher 'nerdio' -Product 'nmm' -Name 'nmm-plan' -Terms $terms -Accept | Out-Null
-        Write-Host "Marketplace terms accepted." -ForegroundColor Green
-    } else {
-        Write-Host "Marketplace terms already accepted." -ForegroundColor DarkGray
-    }
-} catch {
-    Write-Warning "Could not accept marketplace terms automatically: $_"
+Write-Host "Accepting Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
+$termsOutput = az vm image terms accept --publisher nerdio --offer nmm --plan nmm-plan --only-show-errors 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Marketplace terms accepted." -ForegroundColor Green
+} else {
+    Write-Warning ("Could not accept marketplace terms: {0}" -f ($termsOutput -join ' '))
     Write-Warning "If deployment fails with MarketplacePurchaseEligibilityFailed, the subscription type may not allow marketplace purchases (e.g. CSP/MSDN/sponsored), or a private marketplace policy may be blocking the publisher."
 }
 
