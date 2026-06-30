@@ -19,7 +19,7 @@ $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
     'Microsoft.Insights','Microsoft.OperationalInsights','Microsoft.DesktopVirtualization',
     'Microsoft.Network','Microsoft.AAD','Microsoft.RecoveryServices','Microsoft.Web',
-    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql'
+    'Microsoft.Quota','Microsoft.Solutions','Microsoft.Sql','Microsoft.MarketplaceOrdering'
 )
 
 # ====================================================================
@@ -470,6 +470,15 @@ Write-Host ("Selected: {0} ({1})" -f $eligible[$idx - 1].DisplayName, $Location)
 Write-Banner "Deploying NMM"
 if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
     New-AzResourceGroup -Name $ResourceGroupName -Location $Location
+}
+
+Write-Host "Accepting Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
+$termsOutput = az vm image terms accept --publisher nerdio --offer nmm --plan nmm-plan --only-show-errors 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "Marketplace terms accepted." -ForegroundColor Green
+} else {
+    Write-Warning ("Could not accept marketplace terms: {0}" -f ($termsOutput -join ' '))
+    Write-Warning "If deployment fails with MarketplacePurchaseEligibilityFailed, the subscription type may not allow marketplace purchases (e.g. CSP/MSDN/sponsored), or a private marketplace policy may be blocking the publisher."
 }
 
 $SqlPassword    = New-StrongPassword -Length 20
