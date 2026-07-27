@@ -200,7 +200,7 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
 }
 
 if (-not $SubscriptionId) {
-    $allSubs = az account list --only-show-errors 2>$null | ConvertFrom-Json
+    $allSubs = az account list --refresh --all --only-show-errors 2>$null | ConvertFrom-Json
     if (-not $allSubs -or @($allSubs).Count -eq 0) {
         throw "No Azure subscriptions found. Run 'az login' first."
     }
