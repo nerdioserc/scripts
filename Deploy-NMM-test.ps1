@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ResourceGroupName,
@@ -15,6 +15,14 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+
+# The NMM post-install configuration script only runs in Azure Cloud Shell, so refuse to start anywhere else
+$inCloudShell = $env:ACC_CLOUD -or
+                ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*') -or
+                ($env:POWERSHELL_DISTRIBUTION_CHANNEL -like 'CloudShell*')
+if (-not $inCloudShell) {
+    throw "This script must be run in Azure Cloud Shell (PowerShell). Open https://shell.azure.com and run it there."
+}
 
 $NmmRequiredProviders = @(
     'Microsoft.KeyVault','Microsoft.Compute','Microsoft.Automation','Microsoft.Storage',
@@ -99,19 +107,42 @@ function Write-Banner {
 
 function New-StrongPassword {
     param([int]$Length = 20)
-    $upper   = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.ToCharArray()
-    $lower   = 'abcdefghijklmnopqrstuvwxyz'.ToCharArray()
-    $digit   = '0123456789'.ToCharArray()
-    $special = '!@#$%^&*'.ToCharArray()
-    $all = $upper + $lower + $digit + $special
-    $chars = @(
-        (Get-Random -InputObject $upper),
-        (Get-Random -InputObject $lower),
-        (Get-Random -InputObject $digit),
-        (Get-Random -InputObject $special)
-    )
-    $chars += 1..($Length - 4) | ForEach-Object { Get-Random -InputObject $all }
-    -join ($chars | Sort-Object { Get-Random })
+    $sets  = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz', '0123456789', '!@#$%^&*'
+    $all   = -join $sets
+    $rng   = [System.Security.Cryptography.RandomNumberGenerator]
+    $chars = [System.Collections.Generic.List[char]]::new()
+    foreach ($s in $sets) { $chars.Add($s[$rng::GetInt32($s.Length)]) }
+    while ($chars.Count -lt $Length) { $chars.Add($all[$rng::GetInt32($all.Length)]) }
+    for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+        $j = $rng::GetInt32($i + 1)
+        $tmp = $chars[$i]; $chars[$i] = $chars[$j]; $chars[$j] = $tmp
+    }
+    -join $chars
+}
+
+function Invoke-ArmGet {
+    # GET against ARM with retry on throttling (429), server errors (5xx) and dropped connections
+    param([string]$Uri, [string]$Token, [int]$MaxAttempts = 4)
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            return Invoke-RestMethod -Method GET -Uri $Uri -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
+        } catch {
+            $status    = [int]$_.Exception.Response.StatusCode
+            $retryable = ($status -eq 0) -or ($status -eq 429) -or ($status -ge 500)
+            if (-not $retryable -or $attempt -ge $MaxAttempts) { throw }
+            $wait = [Math]::Pow(2, $attempt)
+            $retryAfter = $_.Exception.Response.Headers.RetryAfter.Delta
+            if ($retryAfter) { $wait = [Math]::Min(60, $retryAfter.TotalSeconds) }
+            Start-Sleep -Seconds ([int][Math]::Ceiling($wait))
+        }
+    }
+}
+
+function Get-ProviderStates {
+    $map  = @{}
+    $list = az provider list --query "[].{ns:namespace, state:registrationState}" -o json --only-show-errors 2>$null | ConvertFrom-Json
+    foreach ($p in $list) { $map[$p.ns] = $p.state }
+    return $map
 }
 
 function Get-SqlRegionStatus {
@@ -121,7 +152,7 @@ function Get-SqlRegionStatus {
     )
     $uri = "https://management.azure.com/subscriptions/$Sub/providers/Microsoft.Sql/locations/$Region/capabilities?api-version=$ApiVersion&include=supportedEditions"
     try {
-        $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $Token" } -ErrorAction Stop
+        $resp = Invoke-ArmGet -Uri $uri -Token $Token
         $reason = $resp.supportedServerVersions.reason | Where-Object { $_ } | Select-Object -First 1
         if ($reason) { $reason = ($reason -replace '\s+', ' ').Trim() }
 
@@ -152,8 +183,7 @@ function Get-AppServiceQuotaStatus {
         [string]$ApiVersion = '2025-03-01'
     )
     if ($Required -lt 1) { $Required = 1 }   # never allow a 0-instance check to pass a 0 limit
-    $headers = @{ Authorization = "Bearer $Token" }
-    $scope   = "https://management.azure.com/subscriptions/$Sub/providers/Microsoft.Web/locations/$Region/providers/Microsoft.Quota"
+    $scope   ="https://management.azure.com/subscriptions/$Sub/providers/Microsoft.Web/locations/$Region/providers/Microsoft.Quota"
 
     $out = [pscustomobject]@{
         Region = $Region; Ok = $false; Reason = ''
@@ -166,7 +196,7 @@ function Get-AppServiceQuotaStatus {
     function Get-All([string]$uri) {
         $items = @()
         while ($uri) {
-            $r = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
+            $r = Invoke-ArmGet -Uri $uri -Token $Token
             $items += @($r.value)
             $uri = $r.nextLink
         }
@@ -384,39 +414,59 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
 }
 
 if (-not $SubscriptionId) {
-    $allSubs = az account list --only-show-errors 2>$null | ConvertFrom-Json
-    if (-not $allSubs -or @($allSubs).Count -eq 0) {
-        throw "No Azure subscriptions found. Run 'az login' first."
+    # --refresh pulls the live list instead of the CLI cache; --all includes non-Enabled subs so they're visible
+    $allSubs     = @(az account list --refresh --all --only-show-errors 2>$null | ConvertFrom-Json)
+    $enabledSubs = @($allSubs | Where-Object { $_.state -eq 'Enabled' })
+    if ($enabledSubs.Count -eq 0) {
+        throw "No enabled Azure subscriptions found for this account."
     }
-    if (@($allSubs).Count -eq 1) {
-        $SubscriptionId = $allSubs[0].id
-        Write-Host ("Using only available subscription: {0}" -f $allSubs[0].name) -ForegroundColor DarkGray
+    if ($allSubs.Count -eq 1) {
+        $SubscriptionId = $enabledSubs[0].id
+        Write-Host ("Using only available subscription: {0}" -f $enabledSubs[0].name) -ForegroundColor DarkGray
     } else {
         Write-Host ''
         Write-Host "Select an Azure subscription:" -ForegroundColor Cyan
-        $defaultIdx = 1
+        $defaultIdx = 0
         for ($i = 0; $i -lt $allSubs.Count; $i++) {
-            $marker = if ($allSubs[$i].isDefault) { ' (current)' } else { '' }
-            Write-Host ("  {0,2}. {1}  [{2}]{3}" -f ($i + 1), $allSubs[$i].name, $allSubs[$i].id, $marker)
-            if ($allSubs[$i].isDefault) { $defaultIdx = $i + 1 }
+            $s      = $allSubs[$i]
+            $marker = if ($s.isDefault) { ' (current)' } else { '' }
+            if ($s.state -eq 'Enabled') {
+                Write-Host ("  {0,2}. {1}  [{2}]{3}" -f ($i + 1), $s.name, $s.id, $marker)
+                if ($s.isDefault -or $defaultIdx -eq 0) { $defaultIdx = $i + 1 }
+            } else {
+                Write-Host ("  {0,2}. {1}  [{2}]{3}  - {4}, can't be used" -f ($i + 1), $s.name, $s.id, $marker, $s.state) -ForegroundColor DarkGray
+            }
         }
-        $pick = Read-Host "Enter choice [$defaultIdx]"
-        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $defaultIdx }
-        $idx = 0
-        if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 1 -or $idx -gt $allSubs.Count) {
-            throw "Invalid subscription choice."
-        }
+        do {
+            $pick = Read-Host "Enter choice [$defaultIdx]"
+            if ([string]::IsNullOrWhiteSpace($pick)) { $pick = "$defaultIdx" }
+            $idx = 0
+            $valid = [int]::TryParse($pick, [ref]$idx) -and $idx -ge 1 -and $idx -le $allSubs.Count
+            if (-not $valid) {
+                Write-Host ("Invalid choice. Enter 1-{0}." -f $allSubs.Count) -ForegroundColor Yellow
+            } elseif ($allSubs[$idx - 1].state -ne 'Enabled') {
+                Write-Host ("That subscription is {0} and can't be used. Pick another." -f $allSubs[$idx - 1].state) -ForegroundColor Yellow
+                $valid = $false
+            }
+        } while (-not $valid)
         $SubscriptionId = $allSubs[$idx - 1].id
         Write-Host ("Selected: {0}" -f $allSubs[$idx - 1].name) -ForegroundColor Green
     }
 }
 
 az account set --subscription $SubscriptionId --only-show-errors | Out-Null
-Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction SilentlyContinue | Out-Null
-
 $ctx = az account show --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run 'az login' first." }
+if ($ctx.id -ne $SubscriptionId -and $ctx.name -ne $SubscriptionId) {
+    throw "Azure CLI couldn't switch to subscription '$SubscriptionId' (still on '$($ctx.name)')."
+}
 $subId = $ctx.id
+
+# The checks use Azure CLI but the deployment uses Az PowerShell, so both must point at the same subscription
+$azCtx = Set-AzContext -SubscriptionId $subId -Tenant $ctx.tenantId -ErrorAction SilentlyContinue
+if (-not $azCtx -or $azCtx.Subscription.Id -ne $subId) {
+    throw "Az PowerShell couldn't switch to subscription '$($ctx.name)'. Run 'Connect-AzAccount -Tenant $($ctx.tenantId)' and re-run the script."
+}
 
 $token = az account get-access-token --query accessToken -o tsv 2>$null
 if (-not $token) { throw "Could not acquire Azure access token." }
@@ -426,6 +476,52 @@ Write-Host ("Subscription : {0}" -f $ctx.name)
 Write-Host ("Sub ID       : {0}" -f $ctx.id)
 Write-Host ("Checking for : App Service '{0}' x{1} (quota)  +  Azure SQL '{2}/{3}'" -f $AppServiceSku, $AppServiceInstances, $SqlEdition, $SqlServiceObjective)
 Write-Host ''
+
+# ====================================================================
+#  Resource group check
+# ====================================================================
+# NMM deploys into the resource group's region, so the RG must be new (created in the region picked later).
+# A soft-deleted Key Vault left by an earlier install into an RG with the same name also blocks the deployment.
+Write-Banner "Resource Group Check"
+while ($true) {
+    $ResourceGroupName = "$ResourceGroupName".Trim()
+    if ($ResourceGroupName -notmatch '^[-\w\.\(\)]{1,90}$' -or $ResourceGroupName.EndsWith('.')) {
+        Write-Host "'$ResourceGroupName' isn't a valid resource group name (1-90 letters, digits, - _ . ( ), can't end in a period)." -ForegroundColor Yellow
+        $ResourceGroupName = Read-Host "Enter a new resource group name"
+        continue
+    }
+    if (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue) {
+        Write-Host "Resource group '$ResourceGroupName' already exists. NMM needs a new resource group." -ForegroundColor Yellow
+        $ResourceGroupName = Read-Host "Enter a new resource group name"
+        continue
+    }
+    $deletedVaults = @(az keyvault list-deleted --only-show-errors 2>$null | ConvertFrom-Json |
+        Where-Object { $_.properties.vaultId -like "*/resourceGroups/$ResourceGroupName-*" })
+    if ($deletedVaults.Count -gt 0) {
+        Write-Host "Soft-deleted Key Vault(s) from an earlier NMM install into '$ResourceGroupName' will block this deployment:" -ForegroundColor Yellow
+        foreach ($kv in $deletedVaults) {
+            Write-Host ("  - {0}  ({1}, deleted {2})" -f $kv.name, $kv.properties.location, $kv.properties.deletionDate) -ForegroundColor Yellow
+        }
+        $ans = Read-Host "Purge them now? [Y/n, N = use a different resource group name]"
+        if ([string]::IsNullOrWhiteSpace($ans) -or $ans -match '^[Yy]') {
+            $purgeFailed = $false
+            foreach ($kv in $deletedVaults) {
+                Write-Host ("  Purging {0} (can take a few minutes)..." -f $kv.name) -ForegroundColor Cyan
+                az keyvault purge --name $kv.name --location $kv.properties.location --only-show-errors
+                if ($LASTEXITCODE -ne 0) { $purgeFailed = $true }
+            }
+            if (-not $purgeFailed) {
+                Write-Host "  Purged." -ForegroundColor Green
+                break
+            }
+            Write-Host "  Purge failed (purge protection may be on). Use a different resource group name." -ForegroundColor Red
+        }
+        $ResourceGroupName = Read-Host "Enter a new resource group name"
+        continue
+    }
+    break
+}
+Write-Host ("Resource group '{0}' will be created in the region you pick." -f $ResourceGroupName) -ForegroundColor Green
 
 # ====================================================================
 #  Phase 0: Permission check
@@ -478,7 +574,11 @@ if (-not $me) {
         Write-Host '  ACTION REQUIRED: Missing permissions will cause the NMM install to fail.' -ForegroundColor Red
         if (-not $isOwner)   { Write-Host ("  -> Assign Owner on subscription '{0}'." -f $ctx.name) -ForegroundColor Red }
         if ($isGA -eq $false){ Write-Host '  -> Assign Global Administrator in Entra ID.' -ForegroundColor Red }
-        Write-Host '  (Continuing for informational purposes...)' -ForegroundColor DarkGray
+        $cont = Read-Host "`nContinue anyway? [y/N]"
+        if ($cont -notmatch '^[Yy]') {
+            Write-Host "Exiting. Fix the permissions above and re-run." -ForegroundColor Red
+            return
+        }
     } else {
         Write-Host '  All required permissions confirmed.' -ForegroundColor Green
     }
@@ -488,11 +588,9 @@ if (-not $me) {
 #  Phase 1: Resource provider registration
 # ====================================================================
 Write-Banner "Phase 1: Resource Provider Registration"
-$providerResults = [System.Collections.Generic.List[object]]::new()
-foreach ($ns in $NmmRequiredProviders) {
-    $state = az provider show --namespace $ns --query registrationState --output tsv --only-show-errors 2>$null
-    if (-not $state) { $state = 'UNKNOWN' }
-    $providerResults.Add([pscustomobject]@{ Provider = $ns; State = $state })
+$states = Get-ProviderStates
+$providerResults = foreach ($ns in $NmmRequiredProviders) {
+    [pscustomobject]@{ Provider = $ns; State = if ($states[$ns]) { $states[$ns] } else { 'UNKNOWN' } }
 }
 $providerResults | Format-Table -AutoSize | Out-Host
 
@@ -522,11 +620,9 @@ if ($unregistered.Count -eq 0) {
     $deadline = (Get-Date).AddMinutes($ProviderTimeoutMinutes)
     do {
         Start-Sleep -Seconds 15
-        $pending = [System.Collections.Generic.List[string]]::new()
-        foreach ($ns in $NmmRequiredProviders) {
-            $state = az provider show --namespace $ns --query registrationState --output tsv --only-show-errors 2>$null
-            if ($state -and $state -ne 'Registered') { $pending.Add("$ns ($state)") }
-        }
+        $states  = Get-ProviderStates
+        $pending = @($NmmRequiredProviders | Where-Object { $states[$_] -and $states[$_] -ne 'Registered' } |
+            ForEach-Object { "$_ ($($states[$_]))" })
         if ($pending.Count -gt 0) { Write-Host ("  Pending: {0}" -f ($pending -join ', ')) }
     } while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline)
     if ($pending.Count -gt 0) {
@@ -594,55 +690,26 @@ while ($true) {
     $apiVersion      = '2023-05-01-preview'   # Microsoft.Sql capabilities
     $quotaApiVersion = '2025-03-01'           # Microsoft.Quota (App Service SKU quota)
     $candidates      = @($candidates)
-    $useParallel     = ($PSVersionTable.PSVersion.Major -ge 7) -and ($candidates.Count -gt 3)
 
-    # ---- Check 1: Azure SQL availability (parallel) ----
-    Write-Host ("Checking Azure SQL {0}/{1} availability..." -f $SqlEdition, $SqlServiceObjective) -ForegroundColor DarkGray
-    if ($useParallel) {
-        $funcDef = ${function:Get-SqlRegionStatus}.ToString()
-        $sqlResults = $candidates | ForEach-Object -Parallel {
-            ${function:Get-SqlRegionStatus} = $using:funcDef
-            Get-SqlRegionStatus -Region $_ -Sub $using:subId -Token $using:token `
-                -Edition $using:SqlEdition -Slo $using:SqlServiceObjective -ApiVersion $using:apiVersion
-        } -ThrottleLimit 15
-    } else {
-        $sqlResults = New-Object System.Collections.Generic.List[object]
-        $i = 0
-        foreach ($slug in $candidates) {
-            $i++
-            Write-Progress -Activity "Checking SQL availability" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
-            $sqlResults.Add( (Get-SqlRegionStatus -Region $slug -Sub $subId -Token $token `
-                -Edition $SqlEdition -Slo $SqlServiceObjective -ApiVersion $apiVersion) )
-        }
-        Write-Progress -Activity "Checking SQL availability" -Completed
-    }
+    # SQL availability and App Service quota for a region run in the same parallel worker (one pass, not two)
+    Write-Host ("Checking Azure SQL {0}/{1} availability and App Service {2} quota..." -f $SqlEdition, $SqlServiceObjective, $AppServiceSku) -ForegroundColor DarkGray
+    $fnArm   = ${function:Invoke-ArmGet}.ToString()
+    $fnSql   = ${function:Get-SqlRegionStatus}.ToString()
+    $fnQuota = ${function:Get-AppServiceQuotaStatus}.ToString()
+    $checkResults = $candidates | ForEach-Object -Parallel {
+        ${function:Invoke-ArmGet}             = $using:fnArm
+        ${function:Get-SqlRegionStatus}       = $using:fnSql
+        ${function:Get-AppServiceQuotaStatus} = $using:fnQuota
+        $sql = Get-SqlRegionStatus -Region $_ -Sub $using:subId -Token $using:token `
+                   -Edition $using:SqlEdition -Slo $using:SqlServiceObjective -ApiVersion $using:apiVersion
+        $app = Get-AppServiceQuotaStatus -Region $_ -Sub $using:subId -Token $using:token `
+                   -Sku $using:AppServiceSku -Required $using:AppServiceInstances -ApiVersion $using:quotaApiVersion
+        [pscustomobject]@{ Region = $_; Sql = $sql; App = $app }
+    } -ThrottleLimit 15
 
-    $sqlByRegion = @{}
-    foreach ($s in $sqlResults) { $sqlByRegion[$s.Region] = $s }
-
-    # ---- Check 2: App Service SKU quota (parallel, separate pass) ----
-    Write-Host ("Checking App Service {0} quota..." -f $AppServiceSku) -ForegroundColor DarkGray
-    if ($useParallel) {
-        $quotaFuncDef = ${function:Get-AppServiceQuotaStatus}.ToString()
-        $appResults = $candidates | ForEach-Object -Parallel {
-            ${function:Get-AppServiceQuotaStatus} = $using:quotaFuncDef
-            Get-AppServiceQuotaStatus -Region $_ -Sub $using:subId -Token $using:token `
-                -Sku $using:AppServiceSku -Required $using:AppServiceInstances -ApiVersion $using:quotaApiVersion
-        } -ThrottleLimit 15
-    } else {
-        $appResults = New-Object System.Collections.Generic.List[object]
-        $i = 0
-        foreach ($slug in $candidates) {
-            $i++
-            Write-Progress -Activity "Checking App Service quota" -Status $slug -PercentComplete ([int](($i / $candidates.Count) * 100))
-            $appResults.Add( (Get-AppServiceQuotaStatus -Region $slug -Sub $subId -Token $token `
-                -Sku $AppServiceSku -Required $AppServiceInstances -ApiVersion $quotaApiVersion) )
-        }
-        Write-Progress -Activity "Checking App Service quota" -Completed
-    }
-
-    $appByRegion = @{}
-    foreach ($a in $appResults) { $appByRegion[$a.Region] = $a }
+    $sqlByRegion = @{}; $appByRegion = @{}
+    foreach ($c in $checkResults) { $sqlByRegion[$c.Region] = $c.Sql; $appByRegion[$c.Region] = $c.App }
+    $appResults = @($checkResults | ForEach-Object { $_.App })
 
     # If the Quota API failed in EVERY region, the problem is the API call itself
     # (unsupported scope, auth, registration), not the subscription's quota.
@@ -804,8 +871,12 @@ while ($true) {
 #  Phase 4: Deployment
 # ====================================================================
 Write-Banner "Deploying NMM"
-if (-not (Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue)) {
-    New-AzResourceGroup -Name $ResourceGroupName -Location $Location
+try {
+    New-AzResourceGroup -Name $ResourceGroupName -Location $Location -ErrorAction Stop | Out-Null
+    Write-Host ("Created resource group '{0}' in {1}." -f $ResourceGroupName, $Location) -ForegroundColor Green
+} catch {
+    Write-Host "Could not create resource group '$ResourceGroupName': $_" -ForegroundColor Red
+    return
 }
 
 Write-Host "Accepting Azure Marketplace terms for nerdio/nmm/nmm-plan..." -ForegroundColor Cyan
@@ -823,16 +894,26 @@ $deploymentName = "nmm-deploy-$(Get-Date -Format 'yyyyMMddHHmmss')"
 $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) "nmm-template-$(Get-Random).json"
 $nmmTemplateJson | Out-File -FilePath $templatePath -Encoding UTF8
 
-$job = New-AzResourceGroupDeployment `
-    -Name $deploymentName `
-    -ResourceGroupName $ResourceGroupName `
-    -TemplateFile $templatePath `
-    -TemplateParameterObject @{ sqlServerPassword = $SqlPassword } `
-    -AsJob
+$job = $null
+try {
+    $job = New-AzResourceGroupDeployment `
+        -Name $deploymentName `
+        -ResourceGroupName $ResourceGroupName `
+        -TemplateFile $templatePath `
+        -TemplateParameterObject @{ sqlServerPassword = $SqlPassword } `
+        -AsJob -ErrorAction Stop
+} catch {
+    Write-Host "Could not start the deployment: $_" -ForegroundColor Red
+}
+if (-not $job) {
+    Remove-Item $templatePath -ErrorAction SilentlyContinue
+    Write-Host "Nothing was deployed. Delete the empty resource group '$ResourceGroupName' before re-running with the same name." -ForegroundColor Yellow
+    return
+}
 
 Write-Host "Deployment '$deploymentName' started..." -ForegroundColor Cyan
 $start = Get-Date
-while ($job.State -eq 'Running') {
+while ($job.State -in 'NotStarted', 'Running') {
     $elapsed = (Get-Date) - $start
     $d = Get-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName -Name $deploymentName -ErrorAction SilentlyContinue
     $state = if ($d) { $d.ProvisioningState } else { 'Starting' }
@@ -841,51 +922,14 @@ while ($job.State -eq 'Running') {
 }
 Write-Host ""
 
+$deployOk = $false
 try {
-    $result = Receive-Job -Job $job -Wait -ErrorAction Stop
-    Write-Host "Deployment succeeded ($($result.ProvisioningState))." -ForegroundColor Green
-
-    $app = Get-AzResource -ResourceGroupName $ResourceGroupName `
-        -ResourceType 'Microsoft.Solutions/applications' -ExpandProperties | Select-Object -First 1
-    $managedRg = ($app.Properties.managedResourceGroupId -split '/')[-1]
-    $webapp    = Get-AzWebApp -ResourceGroupName $managedRg | Select-Object -First 1
-    $url       = "https://$($webapp.DefaultHostName)"
-    Write-Host "Web app URL: $url" -ForegroundColor Cyan
-
-    Write-Host "Waiting for web app to respond" -NoNewline
-    $timeout = (Get-Date).AddMinutes(20)
-    while ((Get-Date) -lt $timeout) {
-        try {
-            $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10 -SkipHttpErrorCheck -ErrorAction Stop
-            Write-Host ""
-            Write-Host "Web app responded (HTTP $($r.StatusCode))." -ForegroundColor Green
-            break
-        } catch {
-            Write-Host "." -NoNewline
-            Start-Sleep -Seconds 15
-        }
+    $result = Receive-Job -Job $job -Wait -ErrorAction Stop | Select-Object -Last 1
+    if ($result.ProvisioningState -ne 'Succeeded') {
+        throw "Deployment finished with state '$($result.ProvisioningState)'."
     }
-    Write-Host "Running NMM post-install configuration..." -ForegroundColor Cyan
-    try {
-        $configBody = @{
-            app   = $webapp.Name
-            rg    = $managedRg
-            subId = $subId
-        } | ConvertTo-Json -Compress
-
-        $configScript = Invoke-RestMethod `
-            -Uri 'https://nmm-live-maintenance.azurewebsites.net/api/packages/6.8.0/script/install' `
-            -Method POST `
-            -Body $configBody `
-            -ContentType 'application/json' `
-            -ErrorAction Stop
-
-        & ([ScriptBlock]::Create($configScript))
-        Write-Host "Post-install configuration complete." -ForegroundColor Green
-    } catch {
-        Write-Host "Post-install configuration failed: $_" -ForegroundColor Red
-        Write-Host "You can run it manually by visiting: $url" -ForegroundColor Yellow
-    }
+    $deployOk = $true
+    Write-Host "Deployment succeeded." -ForegroundColor Green
 }
 catch {
     Write-Host "Deployment failed: $_" -ForegroundColor Red
@@ -905,7 +949,66 @@ catch {
 }
 finally {
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-    if ($templatePath -and (Test-Path $templatePath)) {
-        Remove-Item $templatePath -ErrorAction SilentlyContinue
-    }
+    Remove-Item $templatePath -ErrorAction SilentlyContinue
+}
+if (-not $deployOk) { return }
+
+# ====================================================================
+#  Phase 5: Post-install configuration
+# ====================================================================
+Write-Banner "Configuring NMM"
+$app = Get-AzResource -ResourceGroupName $ResourceGroupName `
+    -ResourceType 'Microsoft.Solutions/applications' -ExpandProperties -ErrorAction SilentlyContinue | Select-Object -First 1
+$managedRg = if ($app) { ($app.Properties.managedResourceGroupId -split '/')[-1] }
+$webapp = if ($managedRg) {
+    Get-AzWebApp -ResourceGroupName $managedRg -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'web-admin-portal-*' } | Select-Object -First 1
+}
+if (-not $webapp) {
+    Write-Host "Deployment succeeded, but the NMM admin portal web app wasn't found in managed resource group '$managedRg'." -ForegroundColor Red
+    Write-Host "Open the managed application in the Azure portal to finish setup." -ForegroundColor Yellow
+    return
+}
+$url = "https://$($webapp.DefaultHostName)"
+Write-Host "Web app URL: $url" -ForegroundColor Cyan
+
+# 502/503/504 mean App Service is still starting. NMM has returned 500 before post-install config runs, so 500 counts as up.
+Write-Host "Waiting for web app to respond" -NoNewline
+$ready   = $false
+$timeout = (Get-Date).AddMinutes(20)
+while ((Get-Date) -lt $timeout) {
+    try {
+        $r = Invoke-WebRequest -Uri $url -TimeoutSec 10 -SkipHttpErrorCheck -ErrorAction Stop
+        if ($r.StatusCode -notin 502, 503, 504) { $ready = $true; break }
+    } catch {}
+    Write-Host "." -NoNewline
+    Start-Sleep -Seconds 15
+}
+Write-Host ""
+if ($ready) {
+    Write-Host "Web app responded (HTTP $($r.StatusCode))." -ForegroundColor Green
+} else {
+    Write-Warning "Web app didn't respond within 20 minutes. Trying the post-install configuration anyway."
+}
+
+Write-Host "Running NMM post-install configuration..." -ForegroundColor Cyan
+try {
+    $configBody = @{
+        app   = $webapp.Name
+        rg    = $managedRg
+        subId = $subId
+    } | ConvertTo-Json -Compress
+
+    $configScript = Invoke-RestMethod `
+        -Uri 'https://nmm-live-maintenance.azurewebsites.net/api/packages/6.8.0/script/install' `
+        -Method POST `
+        -Body $configBody `
+        -ContentType 'application/json' `
+        -ErrorAction Stop
+
+    & ([ScriptBlock]::Create($configScript))
+    Write-Host "Post-install configuration complete." -ForegroundColor Green
+} catch {
+    Write-Host "Post-install configuration failed: $_" -ForegroundColor Red
+    Write-Host "You can run it manually by visiting: $url" -ForegroundColor Yellow
 }
