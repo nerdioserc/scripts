@@ -406,6 +406,34 @@ function Show-GeographyPrompt {
     return $geoMenu[$labels[$idx - 1]]
 }
 
+function Select-AnyRegion {
+    # Advanced option: deploy to any Azure region, skipping the eligibility checks.
+    # Returns the region name, or $null if the user goes back.
+    param($CheckResults)
+    Write-Host ''
+    Write-Host "Advanced: the eligibility checks are skipped. If the region lacks quota or capacity, the deployment will fail and you'll need to fix that yourself." -ForegroundColor DarkYellow
+    while ($true) {
+        $typed = Read-Host "Enter any Azure region name (e.g. eastus, westeurope), or B to go back"
+        if ([string]::IsNullOrWhiteSpace($typed)) { continue }
+        if ($typed -match '^\s*[Bb]\s*$') { return $null }
+        $region = ($typed -replace '\s', '').ToLower()
+        if ($slugToName.ContainsKey($region)) { break }
+        Write-Host ("'{0}' isn't an Azure region. Valid names: {1}" -f $typed.Trim(), (($slugToName.Keys | Sort-Object) -join ', ')) -ForegroundColor Yellow
+    }
+    Write-Host ("Selected (advanced): {0} ({1})" -f $slugToName[$region], $region) -ForegroundColor Green
+    $known = @($CheckResults) | Where-Object { $_.Region -eq $region } | Select-Object -First 1
+    if ($appSvcSlugs.Count -gt 0 -and -not $appSvcSlugs.Contains($region)) {
+        Write-Warning "Azure doesn't list App Service $AppServiceSku as offered in $region, so the deployment will most likely fail there."
+    } elseif (-not $known) {
+        Write-Host "  $region wasn't included in the checks above." -ForegroundColor DarkGray
+    } elseif ($known.Eligible -ne 'YES') {
+        Write-Warning ("Check result for {0}: {1}" -f $region, (@($known.AppServiceReason, $known.SqlReason | Where-Object { $_ }) -join ' | '))
+    }
+    $go = Read-Host "Deploy NMM to ${region}? [y/N, N = back to region selection]"
+    if ($go -match '^[Yy]') { return $region }
+    return $null
+}
+
 # ====================================================================
 #  Pre-flight (az auth)
 # ====================================================================
@@ -682,7 +710,12 @@ while ($true) {
 
     if (-not $candidates -or @($candidates).Count -eq 0) {
         Write-Host "No candidate regions to check." -ForegroundColor Yellow
-        $back = Read-Host "Go back and choose a different geography? [Y/n]"
+        $back = Read-Host "Go back and choose a different geography? [Y/n, A = advanced: deploy to any region]"
+        if ($back -match '^[Aa]') {
+            $Location = Select-AnyRegion
+            if ($Location) { break }
+            $Regions = $null; $Geography = $null; continue
+        }
         if ([string]::IsNullOrWhiteSpace($back) -or $back -match '^[Yy]') { $Regions = $null; $Geography = $null; continue }
         return
     }
@@ -783,18 +816,13 @@ while ($true) {
         Write-Host ("Results CSV: {0}" -f $OutFile) -ForegroundColor Cyan
     }
 
-    if ($eligible.Count -eq 0) {
-        Write-Host "No region has App Service $AppServiceSku (available or requestable) and SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
-        $back = Read-Host "Go back and choose a different geography? [Y/n]"
-        if ([string]::IsNullOrWhiteSpace($back) -or $back -match '^[Yy]') { $Regions = $null; $Geography = $null; continue }
-        Write-Host "Exiting." -ForegroundColor Red
-        return
-    }
-
     # ====================================================================
     #  Phase 3: Region picker
     # ====================================================================
     Write-Banner "Select a region for NMM deployment"
+    if ($eligible.Count -eq 0) {
+        Write-Host "No region has App Service $AppServiceSku (available or requestable) and SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
+    }
     $quotaCol = "${AppServiceSku}Quota"
     for ($i = 0; $i -lt $eligible.Count; $i++) {
         $e = $eligible[$i]
@@ -805,18 +833,31 @@ while ($true) {
         }
     }
     Write-Host ''
+    Write-Host "   A. Advanced: deploy to any region (skips these checks; you handle quota yourself)" -ForegroundColor DarkYellow
     Write-Host "   0. << Back to geography / region selection" -ForegroundColor Cyan
+    Write-Host "   Q. Quit" -ForegroundColor Cyan
 
+    $defaultPick = if ($eligible.Count -gt 0) { '1' } else { '0' }
     $idx = -1
+    $advanced = $false
     do {
-        $pick = Read-Host "`nEnter choice [1]"
-        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = '1' }
+        $pick = Read-Host "`nEnter choice [$defaultPick]"
+        if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $defaultPick }
+        if ($pick -match '^[Qq]') { Write-Host "Exiting without deploying." -ForegroundColor Yellow; return }
+        if ($pick -match '^[Aa]') { $advanced = $true; break }
         if ($pick -match '^[Bb]') { $pick = '0' }
         if (-not [int]::TryParse($pick, [ref]$idx) -or $idx -lt 0 -or $idx -gt $eligible.Count) {
-            Write-Host ("Invalid choice. Enter 0-{0}." -f $eligible.Count) -ForegroundColor Yellow
+            Write-Host ("Invalid choice. Enter a number 0-{0}, A or Q." -f $eligible.Count) -ForegroundColor Yellow
             $idx = -1
         }
     } while ($idx -lt 0)
+
+    if ($advanced) {
+        $Location = Select-AnyRegion -CheckResults $results
+        if ($Location) { break }
+        $Regions = $null; $Geography = $null
+        continue
+    }
 
     if ($idx -eq 0) {
         Write-Host "Returning to geography selection..." -ForegroundColor Cyan
