@@ -421,7 +421,9 @@ function Select-AnyRegion {
         Write-Host ("'{0}' isn't an Azure region. Valid names: {1}" -f $typed.Trim(), (($slugToName.Keys | Sort-Object) -join ', ')) -ForegroundColor Yellow
     }
     Write-Host ("Selected (advanced): {0} ({1})" -f $slugToName[$region], $region) -ForegroundColor Green
-    $known = @($CheckResults) | Where-Object { $_.Region -eq $region } | Select-Object -First 1
+    # Plain loop on purpose: @() around the results List throws "Argument types do not match" in PowerShell 7.4
+    $known = $null
+    foreach ($r in $CheckResults) { if ($r.Region -eq $region) { $known = $r; break } }
     if ($appSvcSlugs.Count -gt 0 -and -not $appSvcSlugs.Contains($region)) {
         Write-Warning "Azure doesn't list App Service $AppServiceSku as offered in $region, so the deployment will most likely fail there."
     } elseif (-not $known) {
