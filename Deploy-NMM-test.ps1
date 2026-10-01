@@ -240,8 +240,8 @@ function Get-AppServiceQuotaStatus {
         if ($qHits.Count -eq 0) {
             # Total Regional VMs is informational; a missing row is not a blocker
             if ($chk.Key -eq 'Total') { continue }
-            # Total Regional VMs can be listed while the SKU row is missing -> effective SKU limit is 0
-            $out.Reason = "No '$($chk.Label)' quota row in this subscription/region (effective limit 0; request via support)"
+            # A missing SKU row doesn't block deployment (francecentral deployed fine without one); quota is just unknown
+            $out.Reason = "No '$($chk.Label)' quota row returned for this subscription/region"
             return $out
         }
 
@@ -262,10 +262,9 @@ function Get-AppServiceQuotaStatus {
         if ($chk.Key -eq 'Sku') { $out.SkuUsed = $used;   $out.SkuLimit = $limit }
         else                    { $out.TotalUsed = $used; $out.TotalLimit = $limit }
 
-        # Total Regional VMs is informational: Azure shows it as 0/0 in regions where it isn't populated
-        # (e.g. West US with B2 0/31), and it rises automatically when SKU quota is granted. Only treat it
-        # as a blocker when it has a real limit that is exhausted; raising the SKU quota fixes that case too.
-        if ($chk.Key -eq 'Total' -and $limit -eq 0) { continue }
+        # Total Regional VMs is informational only (recorded for the CSV, never flags QUOTA). It shows 0/0 where it
+        # isn't populated, and the automatic increase only raises the SKU limit, so flagging on it was misleading.
+        if ($chk.Key -eq 'Total') { continue }
 
         if ($limit -lt $Required -or ($limit - $used) -lt $Required) {
             $out.Reason     = "$($chk.Label): $used of $limit used, need $Required free (quota increase needed)"
@@ -424,12 +423,10 @@ function Select-AnyRegion {
     # Plain loop on purpose: @() around the results List throws "Argument types do not match" in PowerShell 7.4
     $known = $null
     foreach ($r in $CheckResults) { if ($r.Region -eq $region) { $known = $r; break } }
-    if ($appSvcSlugs.Count -gt 0 -and -not $appSvcSlugs.Contains($region)) {
-        Write-Warning "Azure doesn't list App Service $AppServiceSku as offered in $region, so the deployment will most likely fail there."
-    } elseif (-not $known) {
+    if (-not $known) {
         Write-Host "  $region wasn't included in the checks above." -ForegroundColor DarkGray
-    } elseif ($known.Eligible -ne 'YES') {
-        Write-Warning ("Check result for {0}: {1}" -f $region, (@($known.AppServiceReason, $known.SqlReason | Where-Object { $_ }) -join ' | '))
+    } elseif ($known.SqlDb -ne 'Yes') {
+        Write-Warning ("Azure SQL check for {0}: {1}" -f $region, $known.SqlReason)
     }
     $go = Read-Host "Deploy NMM to ${region}? [y/N, N = back to region selection]"
     if ($go -match '^[Yy]') { return $region }
@@ -744,29 +741,20 @@ while ($true) {
 
     $sqlByRegion = @{}; $appByRegion = @{}
     foreach ($c in $checkResults) { $sqlByRegion[$c.Region] = $c.Sql; $appByRegion[$c.Region] = $c.App }
-    $appResults = @($checkResults | ForEach-Object { $_.App })
 
-    # If the Quota API failed in EVERY region, the problem is the API call itself
-    # (unsupported scope, auth, registration), not the subscription's quota.
-    $appQuotaResults = @($appResults | Where-Object { $_ })
-    if ($appQuotaResults.Count -gt 0 -and
-        @($appQuotaResults | Where-Object { $_.Reason -like 'Quota API error*' }).Count -eq $appQuotaResults.Count) {
-        Write-Warning "App Service quota API failed in every region; quota could not be verified. First error: $($appQuotaResults[0].Reason)"
-    }
-
+    # Eligibility is decided by Azure SQL alone. App Service quota data is informational: a region with no
+    # quota row (shown as '-') can still deploy. Only a real quota row with too low a limit is flagged QUOTA.
     $results = New-Object System.Collections.Generic.List[object]
     foreach ($slug in $candidates) {
         $offered   = $appSvcSlugs.Contains($slug)
         $app       = $appByRegion[$slug]
-        $appOk     = $offered -and ($null -ne $app) -and ($app.Ok -eq $true)
         $appQuota  = $offered -and ($null -ne $app) -and ($app.NeedsQuota -eq $true)
         $sql       = $sqlByRegion[$slug]
         $sqlOk     = ($null -ne $sql) -and ($sql.Ok -eq $true)
         $display   = if ($slugToName.ContainsKey($slug)) { $slugToName[$slug] } else { $slug }
-        $appReason = if ($appOk) { '' }
-                     elseif (-not $offered) { "App Service $AppServiceSku not offered" }
+        $appReason = if (-not $offered) { "App Service $AppServiceSku not offered" }
                      elseif ($app) { $app.Reason }
-                     else { 'no App Service quota result' }
+                     else { '' }
         $skuQuota   = '-'
         if ($app -and $null -ne $app.SkuLimit)   { $skuQuota   = '{0}/{1}' -f $app.SkuUsed, $app.SkuLimit }
         $totalQuota = '-'
@@ -774,10 +762,9 @@ while ($true) {
         $results.Add([pscustomobject]@{
             Region           = $slug
             DisplayName      = $display
-            AppService       = if ($appOk) { 'Yes' } elseif ($appQuota) { 'Quota' } else { 'No' }
             "${AppServiceSku}Quota" = $skuQuota
             SqlDb            = if ($sqlOk) { 'Yes' } else { 'No' }
-            Eligible         = if ($appOk -and $sqlOk) { 'YES' } elseif ($appQuota -and $sqlOk) { 'QUOTA' } else { 'no' }
+            Eligible         = if (-not $sqlOk) { 'no' } elseif ($appQuota) { 'QUOTA' } else { 'YES' }
             SqlReason        = if ($sqlOk) { '' } else { if ($sql) { $sql.Reason } else { 'no SQL result' } }
             AppServiceReason = $appReason
             SkuRowName       = if ($app) { $app.SkuRowName } else { '' }
@@ -788,27 +775,16 @@ while ($true) {
 
     $eligRank = @{ 'YES' = 0; 'QUOTA' = 1; 'no' = 2 }
     $sorted   = $results | Sort-Object @{E={ $eligRank[$_.Eligible] }}, DisplayName
-    # Regions that only need a quota increase are still offered in the picker, with a warning
     $eligible = @($sorted | Where-Object { $_.Eligible -eq 'YES' -or $_.Eligible -eq 'QUOTA' })
 
     Write-Banner "Results"
-    $sorted | Format-Table Region, DisplayName, AppService, "${AppServiceSku}Quota", SqlDb, Eligible -AutoSize | Out-Host
-
-    $needQuota = @($sorted | Where-Object { $_.Eligible -eq 'QUOTA' })
-    if ($needQuota.Count -gt 0) {
-        Write-Host "Eligible after a quota increase (SKU quota row exists but limit is too low):" -ForegroundColor Yellow
-        foreach ($r in $needQuota) {
-            Write-Host ("  {0,-22} {1}" -f $r.Region, $r.AppServiceReason) -ForegroundColor Yellow
-        }
-        Write-Host ''
-    }
+    $sorted | Format-Table Region, DisplayName, "${AppServiceSku}Quota", SqlDb, Eligible -AutoSize | Out-Host
 
     $ineligible = @($sorted | Where-Object { $_.Eligible -eq 'no' })
     if ($ineligible.Count -gt 0) {
-        Write-Host "Why regions are not eligible:" -ForegroundColor DarkYellow
+        Write-Host "Why regions are not eligible (Azure SQL $SqlEdition/$SqlServiceObjective):" -ForegroundColor DarkYellow
         foreach ($r in $ineligible) {
-            $why = @($r.AppServiceReason, $r.SqlReason | Where-Object { $_ }) -join ' | '
-            Write-Host ("  {0,-22} {1}" -f $r.Region, $why) -ForegroundColor DarkYellow
+            Write-Host ("  {0,-22} {1}" -f $r.Region, $r.SqlReason) -ForegroundColor DarkYellow
         }
         Write-Host ''
     }
@@ -823,7 +799,7 @@ while ($true) {
     # ====================================================================
     Write-Banner "Select a region for NMM deployment"
     if ($eligible.Count -eq 0) {
-        Write-Host "No region has App Service $AppServiceSku (available or requestable) and SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
+        Write-Host "No region in this selection has Azure SQL $SqlEdition/$SqlServiceObjective available." -ForegroundColor Red
     }
     $quotaCol = "${AppServiceSku}Quota"
     for ($i = 0; $i -lt $eligible.Count; $i++) {
@@ -889,7 +865,7 @@ while ($true) {
                 if ($qr.Message) { Write-Host ("  Note: {0}" -f $qr.Message) -ForegroundColor Yellow }
             } else {
                 Write-Host ("  Quota increase failed: {0}" -f $qr.Message) -ForegroundColor Red
-                Write-Host ("  Manual option: Portal > Quotas > App Service (Public Preview) > Region '{0}' > {1} VMs > pencil icon, or open a 'Service and subscription limits (quotas)' support request." -f $eligible[$idx - 1].DisplayName, $AppServiceSku) -ForegroundColor Yellow
+                Write-Host ("  Manual option: Portal > Quotas > App Service (Public Preview) > Region '{0}' > {1} VMs > pencil icon." -f $eligible[$idx - 1].DisplayName, $AppServiceSku) -ForegroundColor Yellow
                 $go = Read-Host "Continue with deployment anyway? [y/N, B = back to region selection]"
                 if ($go -match '^[Bb]') { $Regions = $null; $Geography = $null; continue }
                 if ($go -notmatch '^[Yy]') {
@@ -1034,16 +1010,22 @@ if ($ready) {
     Write-Warning "Web app didn't respond within 20 minutes. Trying the post-install configuration anyway."
 }
 
+$configUrl  = 'https://nmm-live-maintenance.azurewebsites.net/api/packages/6.8.0/script/install'
+$configBody = @{
+    app   = $webapp.Name
+    rg    = $managedRg
+    subId = $subId
+} | ConvertTo-Json -Compress
+
+Write-Host ''
+Write-Host "Next: downloading and running Nerdio's NMM post-install configuration script from a remote location." -ForegroundColor Cyan
+Write-Host "This is the command being run:" -ForegroundColor Cyan
+Write-Host "  & ([ScriptBlock]::Create((Invoke-RestMethod '$configUrl' -Method POST -Body '$configBody' -ContentType 'application/json')))"
+Write-Host ''
 Write-Host "Running NMM post-install configuration..." -ForegroundColor Cyan
 try {
-    $configBody = @{
-        app   = $webapp.Name
-        rg    = $managedRg
-        subId = $subId
-    } | ConvertTo-Json -Compress
-
     $configScript = Invoke-RestMethod `
-        -Uri 'https://nmm-live-maintenance.azurewebsites.net/api/packages/6.8.0/script/install' `
+        -Uri $configUrl `
         -Method POST `
         -Body $configBody `
         -ContentType 'application/json' `
